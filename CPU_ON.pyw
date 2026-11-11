@@ -1,10 +1,11 @@
 import customtkinter as ctk
 import psutil
-import GPUtil
 import time
 import datetime
 import subprocess
 import threading
+import wmi
+import pythoncom
 
 # --- Configuração Inicial ---
 ctk.set_appearance_mode("dark")
@@ -20,7 +21,7 @@ except:
 
 # --- Configuração de Tamanho e Posição ---
 LARGURA = 220
-ALTURA = 680 # Altura aumentada para caber os cards de temperatura
+ALTURA = 700
 largura_tela = janela.winfo_screenwidth()
 pos_x = largura_tela - LARGURA - 20
 pos_y = 50 
@@ -51,36 +52,79 @@ btn_fechar = ctk.CTkButton(janela, text="X", width=25, height=25,
                            command=fechar_app)
 btn_fechar.place(x=LARGURA - 30, y=5)
 
-# --- Variáveis e Thread de Temperatura ---
+# --- Variáveis Globais de Sensores ---
 temp_cpu_atual = "N/A"
 temp_cpu_float = 0.0
+temp_gpu_atual = "N/A"
+temp_gpu_float = 0.0
+uso_gpu_global = "N/A"
 
-def atualizar_temp_cpu_background():
-    global temp_cpu_atual, temp_cpu_float
+# --- Thread: Temperaturas (OpenHardwareMonitor) ---
+def atualizar_temperaturas_ohm():
+    global temp_cpu_atual, temp_cpu_float, temp_gpu_atual, temp_gpu_float
+    pythoncom.CoInitialize() # Necessário para rodar WMI em threads
+    
     while True:
         try:
-            si = subprocess.STARTUPINFO()
-            si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            w = wmi.WMI(namespace=r"root\OpenHardwareMonitor")
+            sensores = w.Sensor(SensorType="Temperature")
+            
+            cpu_temps = []
+            gpu_temps = []
+            
+            for sensor in sensores:
+                identificador = str(sensor.Identifier).lower()
+                if "cpu" in identificador:
+                    cpu_temps.append(float(sensor.Value))
+                elif "gpu" in identificador:
+                    gpu_temps.append(float(sensor.Value))
+            
+            if cpu_temps:
+                temp_cpu_float = max(cpu_temps)
+                temp_cpu_atual = f"{temp_cpu_float:.1f}°C"
+            else:
+                temp_cpu_atual = "N/A"
+            
+            if gpu_temps:
+                temp_gpu_float = max(gpu_temps)
+                temp_gpu_atual = f"{temp_gpu_float:.1f}°C"
+            else:
+                temp_gpu_atual = "N/A"
+                
+        except Exception:
+            temp_cpu_atual = "N/A"
+            temp_gpu_atual = "N/A"
+        
+        time.sleep(2)
+
+threading.Thread(target=atualizar_temperaturas_ohm, daemon=True).start()
+
+# --- Thread: Uso de GPU Universal (PowerShell) ---
+def atualizar_uso_gpu_background():
+    global uso_gpu_global
+    cmd_gpu = '(((Get-Counter "\\GPU Engine(*engtype_3D)\\Utilization Percentage" -ErrorAction SilentlyContinue).CounterSamples | Measure-Object -Property CookedValue -Sum).Sum)'
+    
+    si = subprocess.STARTUPINFO()
+    si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    
+    while True:
+        try:
             output = subprocess.check_output(
-                ["powershell", "-NoProfile", "-Command", 
-                 "(Get-WmiObject MSAcpi_ThermalZoneTemperature -Namespace 'root/wmi').CurrentTemperature"],
+                ["powershell", "-NoProfile", "-Command", cmd_gpu],
                 startupinfo=si, text=True, stderr=subprocess.DEVNULL
             ).strip()
             
             if output:
-                temp_c = (int(output) / 10.0) - 273.15
-                temp_cpu_float = temp_c
-                temp_cpu_atual = f"{temp_c:.1f}°C"
+                valor = float(output.replace(',', '.'))
+                uso_gpu_global = min(valor, 100.0) # Garante que não passe de 100%
             else:
-                temp_cpu_atual = "N/A"
-                temp_cpu_float = 0.0
-        except:
-            temp_cpu_atual = "N/A"
-            temp_cpu_float = 0.0
-        
-        time.sleep(5)
+                uso_gpu_global = "N/A"
+        except Exception:
+            uso_gpu_global = "N/A"
+            
+        time.sleep(1.5)
 
-threading.Thread(target=atualizar_temp_cpu_background, daemon=True).start()
+threading.Thread(target=atualizar_uso_gpu_background, daemon=True).start()
 
 # --- Função Auxiliar de Formatação de Rede ---
 def formatar_tamanho(tamanho_em_bytes):
@@ -90,10 +134,22 @@ def formatar_tamanho(tamanho_em_bytes):
         tamanho_em_bytes /= 1024.0
     return f"{tamanho_em_bytes:.1f} TB/s"
 
-# --- Função Auxiliar para Mini Cards ---
-def criar_mini_card(master, nome_padrao, mostrar_barra=True):
+# --- Interface Base ---
+titulo = ctk.CTkLabel(janela, text="Sistema", font=("Arial", 14, "bold"))
+titulo.pack(pady=(10, 0))
+
+lbl_uptime = ctk.CTkLabel(janela, text="Ligado há: --", font=("Arial", 11, "italic"), text_color="gray")
+lbl_uptime.pack(pady=(0, 5))
+
+# Container para os cards suportar ocultação (grid)
+frame_cards = ctk.CTkFrame(janela, fg_color="transparent")
+frame_cards.pack(fill="both", expand=True)
+frame_cards.grid_columnconfigure(0, weight=1)
+
+# --- Função Auxiliar para Mini Cards (Agora com Grid) ---
+def criar_mini_card(master, nome_padrao, linha, mostrar_barra=True):
     frame = ctk.CTkFrame(master, corner_radius=8)
-    frame.pack(pady=4, padx=10, fill="x")
+    frame.grid(row=linha, column=0, pady=4, padx=10, sticky="ew")
     
     lbl_info = ctk.CTkLabel(frame, text=f"{nome_padrao}: --", font=("Arial", 12, "bold"))
     lbl_info.pack(pady=(5, 5 if not mostrar_barra else 0), padx=10, anchor="w")
@@ -104,34 +160,25 @@ def criar_mini_card(master, nome_padrao, mostrar_barra=True):
         pb.pack(pady=(5, 8), padx=10, fill="x")
         pb.set(0)
     
-    return lbl_info, pb
+    return frame, lbl_info, pb
 
-# Função de cores dinâmicas para temperatura
 def atualizar_cor_temp(pb, valor_temp):
     if valor_temp < 65:
-        pb.configure(progress_color=["#1f6aa5", "#1f538d"]) # Azul padrão
+        pb.configure(progress_color=["#1f6aa5", "#1f538d"])
     elif valor_temp < 80:
-        pb.configure(progress_color="#e67e22") # Laranja (Atenção)
+        pb.configure(progress_color="#e67e22")
     else:
-        pb.configure(progress_color="#C62828") # Vermelho (Perigo)
+        pb.configure(progress_color="#C62828")
 
-# --- Interface ---
-titulo = ctk.CTkLabel(janela, text="Sistema", font=("Arial", 14, "bold"))
-titulo.pack(pady=(10, 0))
-
-lbl_uptime = ctk.CTkLabel(janela, text="Ligado há: --", font=("Arial", 11, "italic"), text_color="gray")
-lbl_uptime.pack(pady=(0, 5))
-
-lbl_cpu, pb_cpu = criar_mini_card(janela, "CPU (Uso)")
-lbl_temp_cpu, pb_temp_cpu = criar_mini_card(janela, "Temp CPU")
-
-lbl_gpu, pb_gpu = criar_mini_card(janela, "GPU (Uso)")
-lbl_temp_gpu, pb_temp_gpu = criar_mini_card(janela, "Temp GPU")
-
-lbl_ram, pb_ram = criar_mini_card(janela, "RAM")
-lbl_disco, pb_disco = criar_mini_card(janela, "Disco")
-lbl_rede, _ = criar_mini_card(janela, "Rede", mostrar_barra=False) 
-lbl_bateria, pb_bateria = criar_mini_card(janela, "Bateria")
+# --- Criação dos Cards ---
+frm_cpu, lbl_cpu, pb_cpu = criar_mini_card(frame_cards, "CPU (Uso)", 0)
+frm_temp_cpu, lbl_temp_cpu, pb_temp_cpu = criar_mini_card(frame_cards, "Temp CPU", 1)
+frm_gpu, lbl_gpu, pb_gpu = criar_mini_card(frame_cards, "GPU (Uso)", 2)
+frm_temp_gpu, lbl_temp_gpu, pb_temp_gpu = criar_mini_card(frame_cards, "Temp GPU", 3)
+frm_ram, lbl_ram, pb_ram = criar_mini_card(frame_cards, "RAM", 4)
+frm_disco, lbl_disco, pb_disco = criar_mini_card(frame_cards, "Disco", 5)
+frm_rede, lbl_rede, _ = criar_mini_card(frame_cards, "Rede", 6, mostrar_barra=False) 
+frm_bateria, lbl_bateria, pb_bateria = criar_mini_card(frame_cards, "Bateria", 7)
 
 # Toggle de Visualização (Tema)
 frame_opcoes = ctk.CTkFrame(janela, fg_color="transparent")
@@ -149,15 +196,15 @@ menu_tema = ctk.CTkOptionMenu(frame_opcoes, values=["Escuro", "Claro"],
                               command=mudar_tema, width=80, height=24)
 menu_tema.pack(side="right", padx=5)
 
-# --- Variáveis globais de controle ---
+# --- Variáveis globais de controle do loop ---
 last_disk_io = psutil.disk_io_counters()
 last_net_io = psutil.net_io_counters()
 last_time = time.time()
 psutil.cpu_percent(interval=None)
 
-# --- Função de Atualização Contínua ---
+# --- Função de Atualização Contínua (Main Thread) ---
 def atualizar_dados():
-    global last_disk_io, last_net_io, last_time, temp_cpu_atual, temp_cpu_float
+    global last_disk_io, last_net_io, last_time
 
     current_time = time.time()
     delta_time = current_time - last_time
@@ -174,30 +221,36 @@ def atualizar_dados():
     else:
         lbl_uptime.configure(text=f"Ligado há: {horas}h {minutos}m {segundos}s")
 
-    # CPU (Uso e Temp)
+    # CPU (Uso)
     uso_cpu = psutil.cpu_percent(interval=None)
     lbl_cpu.configure(text=f"CPU: {uso_cpu}%")
     pb_cpu.set(uso_cpu / 100)
 
-    lbl_temp_cpu.configure(text=f"Temp CPU: {temp_cpu_atual}")
-    pb_temp_cpu.set(min(temp_cpu_float / 100.0, 1.0)) # Máximo visual de 100°C
-    atualizar_cor_temp(pb_temp_cpu, temp_cpu_float)
-
-    # GPU (Uso e Temp)
-    gpus = GPUtil.getGPUs()
-    if gpus:
-        gpu = gpus[0]
-        lbl_gpu.configure(text=f"GPU: {gpu.load * 100:.1f}%")
-        pb_gpu.set(gpu.load)
-
-        lbl_temp_gpu.configure(text=f"Temp GPU: {gpu.temperature:.1f}°C")
-        pb_temp_gpu.set(min(gpu.temperature / 100.0, 1.0))
-        atualizar_cor_temp(pb_temp_gpu, gpu.temperature)
+    # TEMP CPU (Oculta se não lido)
+    if temp_cpu_atual == "N/A":
+        frm_temp_cpu.grid_remove()
     else:
-        lbl_gpu.configure(text="GPU: N/A")
-        pb_gpu.set(0)
-        lbl_temp_gpu.configure(text="Temp GPU: N/A")
-        pb_temp_gpu.set(0)
+        frm_temp_cpu.grid()
+        lbl_temp_cpu.configure(text=f"Temp CPU: {temp_cpu_atual}")
+        pb_temp_cpu.set(min(temp_cpu_float / 100.0, 1.0))
+        atualizar_cor_temp(pb_temp_cpu, temp_cpu_float)
+
+    # GPU USO (Oculta se não lido)
+    if uso_gpu_global == "N/A":
+        frm_gpu.grid_remove()
+    else:
+        frm_gpu.grid()
+        lbl_gpu.configure(text=f"GPU: {uso_gpu_global:.1f}%")
+        pb_gpu.set(uso_gpu_global / 100.0)
+
+    # TEMP GPU (Oculta se não lido)
+    if temp_gpu_atual == "N/A":
+        frm_temp_gpu.grid_remove()
+    else:
+        frm_temp_gpu.grid()
+        lbl_temp_gpu.configure(text=f"Temp GPU: {temp_gpu_atual}")
+        pb_temp_gpu.set(min(temp_gpu_float / 100.0, 1.0))
+        atualizar_cor_temp(pb_temp_gpu, temp_gpu_float)
 
     # RAM
     ram = psutil.virtual_memory()
@@ -216,22 +269,20 @@ def atualizar_dados():
         
         lbl_disco.configure(text=f"Disco: {uso_disco:.1f}%")
         pb_disco.set(uso_disco / 100)
-        
-    last_disk_io = current_disk_io
+        last_disk_io = current_disk_io
 
     # REDE
     current_net_io = psutil.net_io_counters()
     if current_net_io and last_net_io and delta_time > 0:
         down_speed = (current_net_io.bytes_recv - last_net_io.bytes_recv) / delta_time
         up_speed = (current_net_io.bytes_sent - last_net_io.bytes_sent) / delta_time
-        
         lbl_rede.configure(text=f"Rede: ↓ {formatar_tamanho(down_speed)} | ↑ {formatar_tamanho(up_speed)}")
-        
-    last_net_io = current_net_io
+        last_net_io = current_net_io
 
-    # BATERIA
+    # BATERIA (Oculta se não detectada, ex: Desktops)
     bateria = psutil.sensors_battery()
     if bateria:
+        frm_bateria.grid()
         percentual = bateria.percent
         conectado = " (Tomada)" if bateria.power_plugged else ""
         lbl_bateria.configure(text=f"Bateria: {percentual:.1f}%{conectado}")
@@ -242,8 +293,7 @@ def atualizar_dados():
         else:
             pb_bateria.configure(progress_color=["#1f6aa5", "#1f538d"])
     else:
-        lbl_bateria.configure(text="Bateria: Não detectada")
-        pb_bateria.set(0)
+        frm_bateria.grid_remove()
 
     last_time = current_time
     janela.after(1000, atualizar_dados)
